@@ -1,337 +1,320 @@
-import re
 import json
 import os
+import re
 from datetime import datetime
 
-# ==========================================
-# 參數與權重設定 (依據玉山比賽限制與策略調整)
-# ==========================================
-WEIGHT_MACRO = 0.3    # 大盤斜率權重 (建議追蹤 NASDAQ 或 費半)
-WEIGHT_STOCK = 0.3    # 個股動能權重
-WEIGHT_LLM = 0.2      # LLM 質化判斷權重
-WEIGHT_TWD = 0.2      # 台幣資金面權重 (判斷外資動向)
+try:
+    import yfinance as yf
+except ImportError:
+    yf = None
+    print("⚠️ 提醒：尚未安裝 yfinance，股價與新聞抓取將使用備用假資料。請執行 pip install yfinance")
 
-THRESHOLD_BUY = 70    # 買進門檻總分 (滿分100)
-THRESHOLD_SELL = 65   # 賣出門檻總分 (對風險較敏感，寧可錯殺不願抱虧)
 
 # ==========================================
-# 輔助函數：各項因子的動態計算邏輯
-# ==========================================
-def extract_llm_score(llm_text):
-    """【第 3 部分】動態解析 LLM 回傳文字中的信心分數"""
-    match = re.search(r"信心分數[：:]\s*(\d+)", llm_text)
-    if match:
-        return int(match.group(1))
-    return 50 # 若解析失敗，給予中立分數，避免程式崩潰
-
-def evaluate_macro_slope(macro_current, macro_prev):
-    """【第 1 部分】動態計算大盤斜率 (二階導數：加速度判斷)"""
-    delta = macro_current - macro_prev
-    buy_score = 50
-    sell_score = 50
-    
-    if macro_current > 0:
-        if delta < 0: # 漲得變慢 (高檔背離)
-            buy_score = max(0, 50 - abs(delta) * 20)
-            sell_score = min(100, 60 + abs(delta) * 30)
-        else:         # 漲得快 (趨勢強勁，順勢而為)
-            buy_score = min(100, 60 + delta * 30)
-            sell_score = max(0, 40 - delta * 20)
-    else:
-        if delta > 0: # 跌得變慢 (落底反彈)
-            buy_score = min(100, 60 + abs(delta) * 30)
-            sell_score = max(0, 40 - abs(delta) * 20)
-        else:         # 跌得變快 (恐慌殺跌，無情停損)
-            buy_score = 10 
-            sell_score = min(100, 60 + abs(delta) * 40) 
-            
-    return buy_score, sell_score
-
-def evaluate_forex(twd_current, twd_prev):
-    """【第 4 部分】判斷台幣匯率 (外資動向)"""
-    if twd_current < twd_prev: # 台幣升值 (熱錢匯入)
-        return {"buy": 80, "sell": 20}
-    elif twd_current > twd_prev: # 台幣貶值 (熱錢撤出)
-        return {"buy": 20, "sell": 80}
-    return {"buy": 50, "sell": 50}
-
-def evaluate_held_stock_sell(momentum_index, is_profitable):
-    """【第 2 部分-賣】計算庫存個股的賣壓分數 (風險乘數基礎)"""
-    sell_score = 50
-    if momentum_index > 0:
-        sell_score = 50 + (momentum_index * 5) # 連漲越多，乖離率越高，超買風險增加
-    elif momentum_index < 0:
-        sell_score = 50 + (abs(momentum_index) * 10) # 連跌，停損壓力急劇增加
-        
-    if is_profitable:
-        sell_score += 15 # 只要有賺錢，停利賣壓增加 (把獲利放口袋)
-    else:
-        if momentum_index < 0:
-            sell_score += 20 # 賠錢又連跌，無情停損加分 (控制 MDD)
-            
-    return max(0, min(100, sell_score))
-
-def evaluate_unowned_stock_buy(momentum_index):
-    """【第 2 部分-買】計算空手個股的買進分數"""
-    if momentum_index > 0:
-        return min(100, 50 + (momentum_index * 10)) # 順勢突破買進
-    elif momentum_index < 0:
-        return max(0, 50 - (abs(momentum_index) * 10)) # 弱勢股不碰
-    return 50
-
-# ==========================================
-# 核心決策大腦 (雙軌制：買進軌道 vs 賣出軌道)
-# ==========================================
-def generate_trading_decision(stock_id, is_owned, macro_current, macro_prev, 
-                              twd_current, twd_prev, momentum_index, 
-                              llm_text, current_price=0, buy_price=0):
-    
-    macro_buy, macro_sell = evaluate_macro_slope(macro_current, macro_prev)
-    forex_scores = evaluate_forex(twd_current, twd_prev)
-    llm_score = extract_llm_score(llm_text)
-    
-    if is_owned:
-        # --- 進入【賣出軌道 (SELL Track)】 ---
-        is_profitable = current_price > buy_price
-        stock_sell = evaluate_held_stock_sell(momentum_index, is_profitable)
-        llm_sell = 100 - llm_score # LLM 分數反轉 (看好 = 不想賣)
-        
-        # 動態乘數：個股超買(連漲) * 大盤賣出信心
-        if momentum_index > 0:
-            stock_sell = stock_sell * (macro_sell / 100.0) 
-            
-        total_score = (
-            (macro_sell * WEIGHT_MACRO) +
-            (stock_sell * WEIGHT_STOCK) +
-            (llm_sell * WEIGHT_LLM) +
-            (forex_scores["sell"] * WEIGHT_TWD)
-        )
-        action = "賣出 (SELL)" if total_score >= THRESHOLD_SELL else "觀望 (HOLD)"
-        return {"stock_id": stock_id, "action": action, "score": round(total_score, 2), "track": "SELL"}
-        
-    else:
-        # --- 進入【買進軌道 (BUY Track)】 ---
-        stock_buy = evaluate_unowned_stock_buy(momentum_index)
-        
-        total_score = (
-            (macro_buy * WEIGHT_MACRO) +
-            (stock_buy * WEIGHT_STOCK) +
-            (llm_score * WEIGHT_LLM) +
-            (forex_scores["buy"] * WEIGHT_TWD)
-        )
-        action = "買進 (BUY)" if total_score >= THRESHOLD_BUY else "觀望 (HOLD)"
-        return {"stock_id": stock_id, "action": action, "score": round(total_score, 2), "track": "BUY"}
-
-# ==========================================
-# 部位管理與儲存系統 (Portfolio Manager)
+# 模組 1：投資組合與記憶管理員 (大腦記憶區)
 # ==========================================
 class PortfolioManager:
-    def __init__(self, filepath="my_portfolio.json"):
-        """初始化部位管理器，包含比賽規定的 10 億初始資金"""
-        self.filepath = filepath
-        self.cash = 1000000000 
-        self.holdings = {}     
-        self.load_data()
+    def __init__(self, filename="my_portfolio.json"):
+        self.filename = filename
+        self.cash = 1000000000  # 初始本金 10 億台幣
+        self.positions = {}     # 庫存紀錄
+        self.load_portfolio()
 
-    def load_data(self):
-        if os.path.exists(self.filepath):
-            with open(self.filepath, 'r', encoding='utf-8') as f:
+    def load_portfolio(self):
+        if os.path.exists(self.filename):
+            with open(self.filename, 'r', encoding='utf-8') as f:
                 data = json.load(f)
-                self.cash = data.get("cash", 1000000000)
-                self.holdings = data.get("holdings", {})
+                self.cash = data.get("cash", self.cash)
+                self.positions = data.get("positions", {})
 
-    def save_data(self):
-        with open(self.filepath, 'w', encoding='utf-8') as f:
-            json.dump({"cash": self.cash, "holdings": self.holdings}, f, indent=4, ensure_ascii=False)
+    def save_portfolio(self):
+        with open(self.filename, 'w', encoding='utf-8') as f:
+            json.dump({"cash": self.cash, "positions": self.positions}, f, indent=4, ensure_ascii=False)
 
     def get_nav(self, current_prices):
-        """計算總投資組合淨值 (NAV)"""
-        total_stock_value = 0
-        for stock_id, data in self.holdings.items():
-            price = current_prices.get(stock_id, data["buy_price"])
-            total_stock_value += price * data["shares"] * 1000
-        return self.cash + total_stock_value
+        stock_value = 0
+        for stock_id, pos in self.positions.items():
+            price = current_prices.get(stock_id, pos['buy_price'])
+            stock_value += pos['shares'] * price * 1000
+        return self.cash + stock_value
 
-    def calculate_order_size(self, stock_id, action, score, price, current_prices):
-        """根據信心分數與比賽規則，動態計算該買/賣幾張"""
-        nav = self.get_nav(current_prices)
-        
-        if "BUY" in action:
-            # 依據分數決定資金比例 (滿分約佔淨值 4.5%)
-            target_weight = 0.045 * (score / 100) 
-            
-            # 競賽規則：台積電上限 25%，其餘上限 10%
-            max_weight_limit = 0.25 if stock_id == "2330" else 0.10
-            target_weight = min(target_weight, max_weight_limit)
-            
-            current_held_value = self.holdings.get(stock_id, {}).get("shares", 0) * price * 1000
-            allowable_buy_money = (nav * target_weight) - current_held_value
-            
-            # 競賽規則：保留合理現金水位
-            buy_money = max(0, min(allowable_buy_money, self.cash * 0.90))
-            return int(buy_money // (price * 1000))
-            
-        elif "SELL" in action:
-            if stock_id not in self.holdings: return 0
-            current_shares = self.holdings[stock_id]["shares"]
-            
-            if score >= 80:
-                return current_shares # 極度危險或停損：清倉 100%
-            else:
-                return max(1, current_shares // 2) # 一般停利：減碼 50%
-        return 0
+    def calculate_order_size(self, confidence_score):
+        max_weight_limit = 0.10  
+        if confidence_score >= 90: return max_weight_limit * 0.4
+        elif confidence_score >= 70: return max_weight_limit * 0.3
+        else: return 0
 
-    def execute_trade(self, stock_id, action, price, shares):
-        """模擬執行交易，計算手續費與稅，並更新庫存"""
-        if shares <= 0: return None
-        
-        cost_base = price * shares * 1000 
-        trade_record = None
-        
-        if "BUY" in action:
-            total_cost = cost_base * (1 + 0.001425) 
-            if self.cash >= total_cost:
-                self.cash -= total_cost
-                if stock_id in self.holdings:
-                    old_s = self.holdings[stock_id]["shares"]
-                    old_p = self.holdings[stock_id]["buy_price"]
-                    new_price = ((old_p * old_s) + (price * shares)) / (old_s + shares)
-                    self.holdings[stock_id]["shares"] += shares
-                    self.holdings[stock_id]["buy_price"] = round(new_price, 2)
-                else:
-                    self.holdings[stock_id] = {"buy_price": price, "shares": shares}
-                trade_record = {"stock_id": stock_id, "type": "BUY", "price": price, "shares": shares}
+    def execute_trade(self, stock_id, action, current_price, size_ratio=None, shares_to_sell=None):
+        fee_rate = 0.001425  
+        tax_rate = 0.003     
+        today_str = datetime.now().strftime('%Y-%m-%d')
+
+        if action == "BUY" and size_ratio:
+            target_amount = self.cash * size_ratio
+            shares_to_buy = int(target_amount / (current_price * 1000))
+            
+            if shares_to_buy > 0:
+                cost = shares_to_buy * current_price * 1000
+                fee = cost * fee_rate
+                total_cost = cost + fee
                 
-        elif "SELL" in action:
-            if stock_id in self.holdings:
-                sell_shares = min(shares, self.holdings[stock_id]["shares"])
-                net_income = (price * sell_shares * 1000) * (1 - 0.001425 - 0.003) 
-                self.cash += net_income
-                self.holdings[stock_id]["shares"] -= sell_shares
-                trade_record = {"stock_id": stock_id, "type": "SELL", "price": price, "shares": sell_shares}
-                if self.holdings[stock_id]["shares"] <= 0:
-                    del self.holdings[stock_id] 
-                    
-        self.save_data()
-        return trade_record
+                if self.cash >= total_cost:
+                    self.cash -= total_cost
+                    if stock_id in self.positions:
+                        old_shares = self.positions[stock_id]['shares']
+                        old_price = self.positions[stock_id]['buy_price']
+                        old_date = self.positions[stock_id].get('buy_date', today_str)
+                        new_total_shares = old_shares + shares_to_buy
+                        new_avg_price = ((old_shares * old_price) + (shares_to_buy * current_price)) / new_total_shares
+                        self.positions[stock_id]['shares'] = new_total_shares
+                        self.positions[stock_id]['buy_price'] = new_avg_price
+                        self.positions[stock_id]['buy_date'] = old_date
+                    else:
+                        self.positions[stock_id] = {
+                            'shares': shares_to_buy, 
+                            'buy_price': current_price,
+                            'buy_date': today_str 
+                        }
+        
+        elif action == "SELL" and shares_to_sell:
+            if stock_id in self.positions and self.positions[stock_id]['shares'] >= shares_to_sell:
+                revenue = shares_to_sell * current_price * 1000
+                fee = revenue * fee_rate
+                tax = revenue * tax_rate
+                net_revenue = revenue - fee - tax
+                
+                self.cash += net_revenue
+                self.positions[stock_id]['shares'] -= shares_to_sell
+                
+                if self.positions[stock_id]['shares'] <= 0:
+                    del self.positions[stock_id]
+
+        self.save_portfolio()
+
 
 # ==========================================
-# 實戰競賽用：每日排程執行區塊 (Daily Execution Job)
+# 模組 2：資訊獲取與 API 串接 (眼睛與耳朵)
+# ==========================================
+def get_real_macro_data():
+    if not yf: return 0.1, 1.5
+    try:
+        djia = yf.Ticker("^DJI")
+        hist = djia.history(period="5d")
+        if len(hist) >= 3:
+            pct_changes = hist['Close'].pct_change().dropna() * 100
+            today_change = round(pct_changes.iloc[-1], 2)
+            yesterday_change = round(pct_changes.iloc[-2], 2)
+            return today_change, yesterday_change
+    except:
+        pass
+    return 0.1, 1.5
+
+def get_real_stock_data(stock_id, start_date=None):
+    if not yf: return 100, 3 
+    try:
+        ticker = yf.Ticker(stock_id)
+        if start_date:
+            hist = ticker.history(start=start_date)
+            if len(hist) == 0:
+                hist = ticker.history(period="5d")
+        else:
+            hist = ticker.history(period="5d")
+            
+        current_price = round(hist['Close'].iloc[-1], 2)
+        
+        momentum = 0
+        if len(hist) > 1:
+            diffs = hist['Close'].diff().dropna()
+            for diff in diffs:
+                if diff > 0: momentum += 1
+                elif diff < 0: momentum -= 1
+                
+        return current_price, momentum
+    except:
+        return 100, 3
+
+def fetch_real_news(stock_id):
+    if not yf: return "無法抓取新聞"
+    try:
+        ticker = yf.Ticker(stock_id) 
+        news_data = ticker.news
+        if not news_data: return "今日無相關重大新聞。"
+        return " | ".join([item.get('title', '') for item in news_data[:3]])
+    except:
+        return "新聞抓取失敗"
+
+def get_structured_llm_analysis(news_content):
+    prompt = f"""
+    請閱讀以下新聞，判斷該股票未來趨勢。
+    新聞：{news_content}
+    請嚴格以下列 JSON 格式輸出，不要包含任何其他文字：
+    {{"score": 85, "explanation": "看好的原因"}}
+    """
+    
+    # [缺口一：真實 LLM API 串接] 
+    # (未來請刪除下方 if-else 測試區塊，換成真實的 response = llm.generate(prompt) 等程式碼)
+    if "無相關" in news_content or "失敗" in news_content:
+        raw_output = '{"score": 50, "explanation": "缺乏新聞資訊，給予中立評價。"}'
+    else:
+        raw_output = '{"score": 75, "explanation": "近期有相關市場動態，可能帶動波段行情。"}'
+        
+    try:
+        clean_json = raw_output.replace('```json', '').replace('```', '').strip()
+        data = json.loads(clean_json)
+        return data
+    except:
+        return {"score": 50, "explanation": "JSON 解析失敗，預設為 50 分。"}
+
+
+# ==========================================
+# 模組 3：核心評分演算法 (大腦決策邏輯)
+# ==========================================
+def evaluate_macro_slope(today_change, yesterday_change):
+    delta = today_change - yesterday_change
+    if today_change > 0:
+        if delta < 0: return {"buy": max(0, 40 - abs(delta)*10), "sell": min(100, 60 + abs(delta)*30)}
+        else: return {"buy": min(100, 70 + delta*20), "sell": max(0, 30 - delta*10)}
+    else:
+        if delta > 0: return {"buy": min(100, 60 + delta*30), "sell": max(0, 40 - delta*10)}
+        else: return {"buy": max(0, 20 - abs(delta)*10), "sell": min(100, 60 + abs(delta)*20)}
+
+def evaluate_held_stock_sell(momentum_index, is_profitable):
+    if momentum_index < 0:
+        base_sell_score = 60 + (abs(momentum_index) * 10)
+        if not is_profitable: base_sell_score += 20
+    else:
+        base_sell_score = 50 - (momentum_index * 10)
+        if is_profitable: base_sell_score += 15
+    return max(0, min(100, base_sell_score))
+
+def generate_trading_decision(macro_today, macro_yesterday, fx_today, fx_yesterday, stock_id, momentum_index, is_owned, is_profitable, llm_data):
+    macro_scores = evaluate_macro_slope(macro_today, macro_yesterday)
+    fx_trend = fx_today - fx_yesterday
+    fx_buy_score = 80 if fx_trend < 0 else 30
+    fx_sell_score = 80 if fx_trend > 0 else 30
+    
+    llm_score = llm_data.get("score", 50)
+    llm_sell_score = 100 - llm_score
+    
+    if not is_owned:
+        stock_buy_score = 50 + (momentum_index * 10)
+        total_buy_score = (macro_scores["buy"] * 0.3) + (stock_buy_score * 0.3) + (llm_score * 0.2) + (fx_buy_score * 0.2)
+        return {"action": "BUY" if total_buy_score >= 70 else "HOLD", "score": total_buy_score}
+    else:
+        stock_sell_score = evaluate_held_stock_sell(momentum_index, is_profitable)
+        macro_multiplier = macro_scores["sell"] / 100.0
+        if momentum_index > 0: stock_sell_score = stock_sell_score * macro_multiplier
+        total_sell_score = (macro_scores["sell"] * 0.3) + (stock_sell_score * 0.3) + (llm_sell_score * 0.2) + (fx_sell_score * 0.2)
+        
+        if total_sell_score >= 80: return {"action": "SELL_ALL", "score": total_sell_score}
+        elif total_sell_score >= 65: return {"action": "SELL_HALF", "score": total_sell_score}
+        else: return {"action": "HOLD", "score": total_sell_score}
+
+
+# ==========================================
+# 模組 4：每日執行腳本 (當日報紙與執行區塊)
 # ==========================================
 if __name__ == "__main__":
     print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 開始執行 Agent 每日決策程序...")
     
-    # 初始化投資組合管理器
-    portfolio = PortfolioManager()
+    pm = PortfolioManager()
     
-    # ---------------------------------------------------------
-    # TODO 1: 透過爬蟲或 API 獲取總經數據與 150 檔台股個股資訊
-    # ---------------------------------------------------------
-    # 例如：
-    # macro_today, macro_yesterday = fetch_nasdaq_data()
-    # twd_today, twd_yesterday = fetch_forex_data()
-    # allowed_150_stocks = fetch_competition_stock_list()
-    # market_prices = fetch_current_prices(allowed_150_stocks)
+    MACRO_TODAY, MACRO_YESTERDAY = get_real_macro_data()
     
-    # 模擬佔位變數 (請替換為真實資料)
-    macro_today, macro_yesterday = 1.0, 0.5 
-    twd_today, twd_yesterday = 32.1, 32.2 
-    allowed_150_stocks = ["2330", "2454", "3231"] # 須包含 150 檔
-    market_prices = {"2330": 1050, "2454": 1200, "3231": 150} 
+    # [缺口二：真實匯率資料]
+    FX_TODAY = 32.5
+    FX_YESTERDAY = 32.0
     
-    # ---------------------------------------------------------
-    # TODO 2: 生成所有 150 檔股票的決策與信心分數
-    # ---------------------------------------------------------
-    daily_decisions = []
+    # [缺口三：競賽 150 檔股票池]
+    allowed_150_stocks = [
+        {"id": "2330.TW"},
+        {"id": "2454.TW"},
+        {"id": "3231.TW"}
+    ]
     
-    for stock_id in allowed_150_stocks:
-        # TODO: 計算個股動能指數 (momentum_index)
-        momentum = 1 
+    today_buy_scores = {}
+    today_transactions = []
+    current_prices = {} 
+    
+    # 階段 A：先評估手上現有持股是否該賣
+    stocks_to_evaluate_sell = list(pm.positions.keys())
+    for stock_id in stocks_to_evaluate_sell:
+        buy_date = pm.positions[stock_id].get('buy_date')
+        current_price, momentum = get_real_stock_data(stock_id, start_date=buy_date)
+        current_prices[stock_id] = current_price
         
-        # TODO: 呼叫 Google Cloud Vertex AI (Gemini) 獲取該股票的新聞分析分數
-        llm_analysis_text = "看好未來發展，信心分數：85" 
+        news_content = fetch_real_news(stock_id)
+        llm_analysis_data = get_structured_llm_analysis(news_content)
         
-        is_owned = stock_id in portfolio.holdings
-        buy_price = portfolio.holdings.get(stock_id, {}).get("buy_price", 0)
-        current_price = market_prices.get(stock_id, 0)
+        mock_buy_price = pm.positions[stock_id]['buy_price']
+        is_profitable = current_price > mock_buy_price
         
         decision = generate_trading_decision(
-            stock_id=stock_id, 
-            is_owned=is_owned,
-            macro_current=macro_today, 
-            macro_prev=macro_yesterday, 
-            twd_current=twd_today, 
-            twd_prev=twd_yesterday, 
-            momentum_index=momentum, 
-            llm_text=llm_analysis_text,
-            current_price=current_price, 
-            buy_price=buy_price
+            MACRO_TODAY, MACRO_YESTERDAY, FX_TODAY, FX_YESTERDAY,
+            stock_id, momentum_index=momentum, is_owned=True, is_profitable=is_profitable, llm_data=llm_analysis_data
         )
-        daily_decisions.append(decision)
-    
-    # ---------------------------------------------------------
-    # TODO 3: 競賽核心規則檢查與過濾 (非常重要)
-    # ---------------------------------------------------------
-    # 規則 1: 每日投資組合需介於 20-30 檔個股間。
-    
-    daily_trade_report = []
-    
-    # 1. 優先執行所有「賣出 (SELL)」決策，釋放資金與檔數空間
-    for d in daily_decisions:
-        if "SELL" in d["action"]:
-            stock_id = d["stock_id"]
-            price = market_prices.get(stock_id, 0)
-            shares = portfolio.calculate_order_size(stock_id, "SELL", d["score"], price, market_prices)
+        
+        if decision["action"] in ["SELL_ALL", "SELL_HALF"]:
+            shares_held = pm.positions[stock_id]['shares']
+            sell_amount = shares_held if decision["action"] == "SELL_ALL" else int(shares_held / 2)
+            if sell_amount > 0:
+                pm.execute_trade(stock_id, "SELL", current_price, shares_to_sell=sell_amount)
+                today_transactions.append({"stock_id": stock_id, "action": "SELL", "shares": sell_amount, "price": current_price})
+
+    # 階段 B：評估新標的買進潛力
+    for stock in allowed_150_stocks:
+        if stock["id"] not in pm.positions:
+            current_price, momentum = get_real_stock_data(stock["id"])
+            current_prices[stock["id"]] = current_price
             
-            record = portfolio.execute_trade(stock_id, "SELL", price, shares)
-            if record:
-                daily_trade_report.append(record)
-                
-    # 2. 計算剩餘庫存檔數
-    current_holding_count = len(portfolio.holdings)
-    
-    # 3. 整理「買進 (BUY)」候選名單，排除已經在手上的，並依分數由高至低排序
-    buy_candidates = [d for d in daily_decisions if "BUY" in d["action"] and d["stock_id"] not in portfolio.holdings]
+            news_content = fetch_real_news(stock["id"])
+            llm_analysis_data = get_structured_llm_analysis(news_content)
+            
+            decision = generate_trading_decision(
+                MACRO_TODAY, MACRO_YESTERDAY, FX_TODAY, FX_YESTERDAY,
+                stock["id"], momentum_index=momentum, is_owned=False, is_profitable=False, llm_data=llm_analysis_data
+            )
+            
+            if decision["action"] == "BUY":
+                today_buy_scores[stock["id"]] = decision["score"]
+
+    # 嚴格執行買進與 20~30 檔防呆機制
+    current_holding_count = len(pm.positions)
+    buy_candidates = [{"id": s_id, "score": score} for s_id, score in today_buy_scores.items() if s_id not in pm.positions]
     buy_candidates = sorted(buy_candidates, key=lambda x: x["score"], reverse=True)
     
-    # 4. 精準控制買進數量的防呆機制
-    max_can_buy = 30 - current_holding_count       # 最多還能買幾檔 (不能破 30)
-    min_must_buy = max(0, 20 - current_holding_count) # 至少還要買幾檔 (不能低於 20)
+    max_can_buy = 30 - current_holding_count
+    min_must_buy = max(0, 20 - current_holding_count)
     
     bought_count = 0
     for target in buy_candidates:
         if bought_count >= max_can_buy:
-            break  # 已經達到 30 檔滿水位，強迫停止買進
+            break
             
-        # 買進決策：分數大於等於買進門檻，或者「為了保命湊滿 20 檔」分數不夠也要硬買
-        if target["score"] >= THRESHOLD_BUY or bought_count < min_must_buy:
-            stock_id = target["stock_id"]
-            price = market_prices.get(stock_id, 0)
+        if target["score"] >= 70 or bought_count < min_must_buy:
+            size_ratio = pm.calculate_order_size(target["score"])
+            target_current_price = current_prices[target["id"]]
             
-            shares = portfolio.calculate_order_size(stock_id, "BUY", target["score"], price, market_prices)
+            pm.execute_trade(target["id"], "BUY", target_current_price, size_ratio=size_ratio)
             
-            # 確保資金足夠買進至少1張才算成功進場
-            if shares > 0:
-                record = portfolio.execute_trade(stock_id, "BUY", price, shares)
-                if record:
-                    daily_trade_report.append(record)
-                    bought_count += 1
-
-    # 每日最終安全斷言 (除錯用，實戰若印出警告代表需要微調)
-    final_count = len(portfolio.holdings)
+            target_amount = pm.cash * size_ratio
+            shares_bought = int(target_amount / (target_current_price * 1000))
+            if shares_bought > 0:
+                today_transactions.append({"stock_id": target["id"], "action": "BUY", "shares": shares_bought, "price": target_current_price})
+                bought_count += 1
+            
+    # 每日結算與狀態檢核
+    final_count = len(pm.positions)
     if final_count < 20 or final_count > 30:
         print(f"⚠️ 嚴重警告：今日投資組合檔數為 {final_count}，違反比賽 20~30 檔規定！")
     else:
         print(f"✅ 檔數檢核通過：今日持有 {final_count} 檔個股。")
-                
-    # ---------------------------------------------------------
-    # TODO 4: 產出「當日 Agent 決策報告及交易書」
-    # ---------------------------------------------------------
+        
+    print(f"✅ 決策完成！當前總淨值 (NAV): {pm.get_nav(current_prices):,.0f} 元")
+    print(f"✅ 現金剩餘: {pm.cash:,.0f} 元")
+    
     report_filename = f"trading_report_{datetime.now().strftime('%Y%m%d')}.json"
     with open(report_filename, 'w', encoding='utf-8') as f:
-        json.dump(daily_trade_report, f, indent=4, ensure_ascii=False)
-        
-    print(f"✅ 決策完成！當前總淨值 (NAV): {portfolio.get_nav(market_prices):,.0f} 元")
-    print(f"✅ 現金剩餘: {portfolio.cash:,.0f} 元")
-    print(f"✅ 持股檔數: {len(portfolio.holdings)} 檔")
+        json.dump(today_transactions, f, indent=4, ensure_ascii=False)
+    
     print(f"📄 已產出交易書: {report_filename}")
